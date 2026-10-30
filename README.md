@@ -28,6 +28,7 @@ DERP 服务器，于是诞生了 ip_derper 项目。
 | 环境变量名               | 默认值                              | 说明                                          |
 |---------------------|----------------------------------|---------------------------------------------|
 | DERP_ADDR           | :443                             | HTTPS 监听地址                                  |
+| DERP_HTTPS_PORT     | 443                              | 宿主机 HTTPS 端口映射（仅 compose 用 host 网络之外时生效）  |
 | DERP_HTTP_PORT      | 80                               | HTTP 端口，设为 -1 关闭                          |
 | DERP_HOST           | 127.0.0.1                        | 证书 CN/SAN 与 hostname。**填 IP 或域名都可以**        |
 | DERP_CERTS          | /app/certs/                      | 证书目录                                        |
@@ -43,34 +44,35 @@ DERP 服务器，于是诞生了 ip_derper 项目。
 
 ### 快速运行
 
-推荐用 docker compose，已处理好持久卷、健康检查与防盗权限：
+提供两份 compose 模板，已处理好持久卷、健康检查与权限：
+
+| 模板 | 校验客户端 | 需要 TS_AUTHKEY | 网络 |
+|---|---|---|---|
+| `docker-compose.yml` | ✅ 带防盗（**默认**） | 是 | host |
+| `docker-compose.basic.yml` | ❌ 任何人可用 | 否 | bridge + 端口映射 |
+
+**默认部署（带防盗）**：
 
 ```sh
 cp .env.example .env
-# 编辑 .env，把 DERP_HOST 改成你的公网 IP 或域名
-
-# 基础中转（不校验客户端）
-docker compose --profile basic up -d
-
-# 或带防盗（只有同一 tailnet 的节点可用）
-docker compose --profile anti-theft up -d
+# 编辑 .env：填 DERP_HOST（公网 IP 或域名）和 TS_AUTHKEY
+docker compose up -d
 ```
 
-> 两种模式互斥，必须显式二选一，避免端口与容器名冲突。
+**基础中转（不校验客户端）**：
+
+```sh
+cp .env.example .env
+# 编辑 .env：只需填 DERP_HOST
+docker compose -f docker-compose.basic.yml up -d
+```
+
+> `.env` 里的改动会真实生效（模板已用 `${VAR:-默认}` 引用）。
+> 例外：`DERP_CERTS` / `DERP_CONFIG` 若改动，需同步改模板里的 volumes 挂载点。
 
 只想用 `docker run` 的话：
 
-```sh
-docker run -d --name derper \
-  --restart unless-stopped \
-  -p 443:443 -p 80:80 -p 3478:3478/udp \
-  -e DERP_HOST=<你的公网IP或域名> \
-  -v derper-certs:/app/certs \
-  -v derper-nodekey:/var/lib/derper \
-  ghcr.io/tarocats/ip_derper_plus:latest
-```
-
-需要防盗（会启动 tailscaled，必须加权限）：
+**默认部署（带防盗）**：
 
 ```sh
 docker run -d --name derper \
@@ -78,12 +80,25 @@ docker run -d --name derper \
   --network host \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -e DERP_HOST=<公网IP> \
+  -e DERP_HOST=<你的公网IP或域名> \
   -e DERP_VERIFY_CLIENTS=true \
   -e TS_AUTHKEY=tskey-auth-xxxx \
   -v derper-certs:/app/certs \
   -v derper-nodekey:/var/lib/derper \
   -v derper-state:/var/lib/tailscale \
+  ghcr.io/tarocats/ip_derper_plus:latest
+```
+
+**基础中转（不校验客户端）**：
+
+```sh
+docker run -d --name derper \
+  --restart unless-stopped \
+  -p 443:443 -p 80:80 -p 3478:3478/udp \
+  -e DERP_HOST=<你的公网IP或域名> \
+  -e DERP_VERIFY_CLIENTS=false \
+  -v derper-certs:/app/certs \
+  -v derper-nodekey:/var/lib/derper \
   ghcr.io/tarocats/ip_derper_plus:latest
 ```
 

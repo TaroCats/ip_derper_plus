@@ -1,0 +1,100 @@
+# IP DERPer Plus —— 基础部署模板（**不校验客户端**）
+#
+# 不启动 tailscaled，不校验客户端归属，任何拿到 DERPMap 配置的人都能使用这台中转。
+# 适合自用、或客户端不便加入同一 tailnet 的场景。
+#
+#   启动:   docker compose -f docker-compose.basic.yml up -d
+#   状态:   docker compose -f docker-compose.basic.yml ps
+#   日志:   docker compose -f docker-compose.basic.yml logs -f
+#   停止:   docker compose -f docker-compose.basic.yml down
+#
+#   需要校验客户端（推荐，带防盗）时，用默认模板：
+#     docker compose up -d
+#
+# ⚠️ 与默认模板的差异只有两点：
+#   1. 不需要 TS_AUTHKEY，也不启动 tailscaled
+#   2. 用 bridge + 端口映射（而非 host 网络），因为没有 UDP 打洞辅助需求
+#
+# ---------------------------------------------------------------------------
+# ⚠️ 环境变量生效规则
+#
+#   .env 里的值**必须**在本文件 environment 段用 ${VAR:-默认} 引用才会生效。
+#   直接写死的值会覆盖 .env，导致「改了 .env 却没反应」。
+#   本文件所有变量都已按此规则配置。
+#
+#   例外：DERP_CERTS / DERP_CONFIG 若改动，必须同时改下面 volumes 挂载点。
+#
+# ---------------------------------------------------------------------------
+# 两个卷必须持久化：
+#
+#   derper-certs    -> /app/certs
+#       证书目录。丢失会重签证书，客户端 DERPMap 里的证书哈希
+#       （CertName: sha256-raw:...）随之失效。
+#
+#   derper-nodekey  -> /var/lib/derper
+#       derper 的 nodekey。丢失会生成新的节点身份，mesh 链路失效。
+#
+#   （本模板无 tailscaled，故不需要 derper-state 卷。）
+#
+# ---------------------------------------------------------------------------
+# 其他注意
+#
+#   1. DERP_HOST 必填，改成公网 IP 或域名。先 cp .env.example .env 再改。
+#   2. 用 IP 时证书自动生成 IP 类型 SAN，用域名时生成 DNS 类型 SAN。
+#   3. STUN 是 UDP，防火墙要放行 3478/udp，别只开 TCP。
+#
+# ---------------------------------------------------------------------------
+
+services:
+  derper:
+    image: ghcr.io/tarocats/ip_derper_plus:latest
+    container_name: ip-derper
+    restart: unless-stopped
+
+    ports:
+      # 三个端口都跟随 .env，改 DERP_HTTP_PORT / DERP_STUN_PORT 时映射自动同步
+      - "${DERP_HTTP_PORT:-80}:${DERP_HTTP_PORT:-80}"
+      - "${DERP_HTTPS_PORT:-443}:443"
+      - "${DERP_STUN_PORT:-3478}:${DERP_STUN_PORT:-3478}/udp"
+
+    environment:
+      # —— 必填 ——
+      # :? 表示未设置时直接报错退出，避免用 127.0.0.1 起了个连不上的服务
+      DERP_HOST: "${DERP_HOST:?请在 .env 或环境变量里设置 DERP_HOST 为公网 IP 或域名}"
+
+      # —— 监听与端口 ——
+      DERP_ADDR: "${DERP_ADDR:-:443}"
+      DERP_HTTP_PORT: "${DERP_HTTP_PORT:-80}"
+      DERP_STUN: "${DERP_STUN:-true}"
+      DERP_STUN_PORT: "${DERP_STUN_PORT:-3478}"
+
+      # —— 证书与节点私钥路径 ——
+      DERP_CERTS: "${DERP_CERTS:-/app/certs}"
+      DERP_CONFIG: "${DERP_CONFIG:-/var/lib/derper/derper.key}"
+      # 设为 1 强制重签证书。改了 DERP_HOST 后要换证书时用
+      FORCE_CERT_REGEN: "${FORCE_CERT_REGEN:-0}"
+
+      # —— 本模板关闭校验 ——
+      # 若在 .env 里设了 DERP_VERIFY_CLIENTS=true，它仍会被传入，
+      # 但没有 TS_AUTHKEY / tailscaled，entrypoint 会自动降级并打印警告。
+      DERP_VERIFY_CLIENTS: "${DERP_VERIFY_CLIENTS:-false}"
+
+    volumes:
+      # 挂载点与上面 DERP_CERTS 保持一致（DERP_CONFIG 所在目录固定为 /var/lib/derper）
+      - derper-certs:${DERP_CERTS:-/app/certs}
+      - derper-nodekey:/var/lib/derper
+
+    # 健康检查用 /generate_204，不用 /derp/probe：
+    # 后者在 HTTP 端口会被 302 重定向到 https，而 https 是自签证书，curl 校验必失败。
+    # 必须用 CMD-SHELL 才能让变量在运行时展开；exec 形式（CMD [...]）不展开变量。
+    # $$ 是转义，避免 compose 在解析时就把变量吃掉。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:$${DERP_HTTP_PORT:-80}/generate_204"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  derper-certs:
+  derper-nodekey:
