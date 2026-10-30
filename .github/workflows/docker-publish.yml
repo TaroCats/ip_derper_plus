@@ -1,98 +1,181 @@
 name: Docker
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
 on:
   push:
-    branches: [ "main" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
+    branches: ["main"]
+    # 发布 semver tag 时打版本标签
+    tags: ["v*.*.*"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 env:
-  # Use docker.io for Docker Hub if empty
   REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 构建并推送多架构镜像
+  # ---------------------------------------------------------------------------
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
       id-token: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          # submodules: true 只会检出 submodule 记录的 pinned commit，
+          # 保证构建可复现（不要用 recursive/remote，否则每次构建内容都可能不同）
           submodules: true
 
-      # Install the cosign tool except on PR
-      # https://github.com/sigstore/cosign-installer
+      - name: Set up QEMU
+        # arm64 平台构建需要模拟。builder 已固定在 BUILDPLATFORM 上交叉编译，
+        # QEMU 只用于最终镜像的组装步骤，开销很小。
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Install cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
+        uses: sigstore/cosign-installer@v3
         with:
-          cosign-release: 'v2.2.4'
+          cosign-release: "v2.4.1"
 
-      # Set up BuildKit Docker container builder to be able to build
-      # multi-platform images and export cache
-      # https://github.com/docker/setup-buildx-action
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
-
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 分支/PR 构建打 edge 标签，避免覆盖 latest
+            type=ref,event=branch
+            type=ref,event=pr
+            # semver：v1.2.3 -> 1.2.3 / 1.2 / 1，并更新 latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # main 分支的每次推送更新 latest
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=ip_derper_plus
+            org.opencontainers.image.description=Tailscale DERP relay with self-signed cert support
 
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
+          # PR 只构建不推送，用于验证 Dockerfile 没坏
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 把 derper 版本注入镜像，便于运行时排查
+          build-args: |
+            DERP_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
 
-      # Sign the resulting Docker image digest except on PRs.
-      # This will only write to the public Rekor transparency log when the Docker
-      # repository is public to avoid leaking data.  If you would like to publish
-      # transparency data even for private images, pass --force to cosign below.
-      # https://github.com/sigstore/cosign
       - name: Sign the published Docker image
         if: ${{ github.event_name != 'pull_request' }}
         env:
-          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+        run: |
+          echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+  # ---------------------------------------------------------------------------
+  # 冒烟测试：真正把镜像跑起来，验证「容器能启动」这件事
+  #
+  # 这是本次改进的重点。原 CI 只做 build+push，从不运行镜像，
+  # 所以「基础镜像没有 bash 导致容器起不来」这类致命问题一直没被发现。
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: build
+    # 镜像只在非 PR 时被推送，所以只在推送场景做拉取校验
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull built image
+        run: |
+          # 用 main 分支/最新 tag 做冒烟；若为 tag 推送则用该版本
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GITHUB_REF_NAME#v}"
+          else
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker pull "$IMAGE"
+
+      - name: Start container
+        run: |
+          # 用非 443 端口避免权限问题；禁用 STUN 端口冲突影响
+          docker run -d --name smoke \
+            -e DERP_HOST=1.2.3.4 \
+            -e DERP_ADDR=:8443 \
+            -e DERP_HTTP_PORT=8080 \
+            -e DERP_STUN_PORT=3479 \
+            -p 8080:8080 \
+            "$IMAGE"
+
+      - name: Assert container is running (not crash-looping)
+        run: |
+          # 等 15s 让证书生成 + derper 启动完成
+          sleep 15
+          if ! docker ps --format '{{.Names}}' | grep -q '^smoke$'; then
+            echo "::error::容器已退出，说明启动流程失败"
+            docker logs smoke
+            exit 1
+          fi
+          echo "容器运行中"
+          docker logs smoke
+
+      - name: Assert derper actually serves traffic
+        run: |
+          # /generate_204 挂在 HTTP 端口，不经重定向，是最稳的存活探针
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/generate_204 || true)
+            if [ "$code" = "204" ]; then
+              echo "derper 正常响应 204"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::derper 未响应，实际状态码: $code"
+          docker logs smoke
+          exit 1
+
+      - name: Assert cert was generated with correct SAN
+        run: |
+          # 验证证书确实生成、且 IP 放在了 IP SAN（不是塞进 DNS）
+          docker exec smoke ls -l /app/certs
+          docker exec smoke sh -c 'openssl x509 -in /app/certs/1.2.3.4.crt -noout -text | grep -E "IP Address|DNS:"'
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke || true

@@ -1,38 +1,57 @@
-name: 'Submodules Sync'
+name: "Submodules Sync"
 
 on:
   schedule:
-  - cron: "0 2 * * *"
-  # Allows you to run this workflow manually from the Actions tab or through HTTP API
+    # 每天 02:00 UTC 同步上游 tailscale
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 jobs:
   sync:
-    name: 'Submodules Sync'
+    name: "Submodules Sync"
     runs-on: ubuntu-latest
 
-    # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
+    permissions:
+      contents: write
+
     defaults:
       run:
         shell: bash
 
     steps:
-    # Checkout the repository to the GitHub Actions runner
-    - name: Checkout
-      uses: actions/checkout@v3
-      with:
-        token: ${{ secrets.CI_TOKEN }}
-        submodules: true
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 用内置 GITHUB_TOKEN 即可完成「commit 回本仓库」，
+          # 原版混用了 CI_TOKEN 与 GITHUB_TOKEN：checkout 用 CI_TOKEN，
+          # push 时又把 remote 改写成 GITHUB_TOKEN，两个权限模型互相打架，
+          # 一旦 CI_TOKEN 过期整个流程静默失败。
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: true
+          # 用 recursive 确保嵌套 submodule 也同步
+          fetch-depth: 0
 
-    # Update references
-    - name: Git Sumbodule Update
-      run: |
-        git pull --recurse-submodules
-        git submodule update --remote --recursive
+      - name: Update submodule to upstream HEAD
+        run: |
+          git submodule update --remote --recursive
 
-    - name: Commit update
-      run: |
-        git config --global user.name 'Git bot'
-        git config --global user.email 'bot@noreply.github.com'
-        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-        git commit -am "Auto updated submodule references" && git push || echo "No changes to commit"
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "上游无更新，跳过"
+            exit 0
+          fi
+
+          # 输出上游新 commit，方便在 Actions 日志里追溯
+          echo "tailscale 更新到: $(git -C tailscale rev-parse --short HEAD)"
+          git commit -am "chore: sync tailscale submodule to $(git -C tailscale rev-parse --short HEAD)"
+
+          # 并发保护：若上一个同步任务已推过，这里会失败，重试一次即可
+          git push origin HEAD:main || {
+            echo "推送失败，尝试 rebase 后重推"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          }

@@ -1,0 +1,12 @@
+# 构建上下文精简：这些内容对镜像没有任何贡献，却会拖慢 build 并击穿层缓存
+# 注意：build_cert.sh / entrypoint.sh / patch_derper.sh / tailscale/ 会被 COPY 使用，
+#       禁止写进这里
+.git
+.gitmodules
+.github
+img
+*.md
+Dockerfile
+.dockerignore
+.gitignore
+tailscale/.git
