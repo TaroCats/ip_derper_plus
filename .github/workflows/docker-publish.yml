@@ -11,7 +11,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # 注意：这里不再定义 IMAGE_NAME。
+  # github.repository 保留原始大小写（本仓库是 TaroCats/ip_derper_plus），
+  # 而 GHCR 强制镜像名全小写，直接拼接会报：
+  #   invalid reference format: repository name must be lowercase
+  # 请统一使用 build job 里 image-ref 步骤产出的 steps.image-ref.outputs.image
+  #（smoke-test 通过 needs.build.outputs.image 复用），不要手工拼镜像名。
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -24,7 +29,31 @@ jobs:
       packages: write
       id-token: write
 
+    # 把已小写化的镜像引用传给 smoke-test，保证两者用的是同一个地址
+    outputs:
+      image: ${{ steps.image-ref.outputs.image }}
+
     steps:
+      # ---------------------------------------------------------------
+      # 1. 计算镜像引用（必须全小写）
+      #
+      # GHCR 强制镜像名全小写，而 github.repository 保留原始大小写
+      # （本仓库是 TaroCats/ip_derper_plus）。docker/metadata-action
+      # 内部会自动小写化，所以 build/push 不会报错；但任何手工拼接
+      # 镜像名的地方（如 smoke-test 的 docker pull）都会炸：
+      #   invalid reference format: repository name must be lowercase
+      #
+      # 这里显式小写化，作为唯一的镜像名来源。
+      # ---------------------------------------------------------------
+      - name: Compute lowercase image reference
+        id: image-ref
+        run: |
+          # 只有仓库名的 owner/name 部分需要小写，registry 主机名保持原样
+          owner_repo="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          image="${{ env.REGISTRY }}/${owner_repo}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "镜像引用（已小写化）: ${image}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -58,7 +87,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # 用已小写化的镜像引用，避免 registry 因大小写拒收
+          images: ${{ steps.image-ref.outputs.image }}
           tags: |
             # 分支/PR 构建打 edge 标签，避免覆盖 latest
             type=ref,event=branch
@@ -123,13 +153,17 @@ jobs:
 
       - name: Pull built image
         run: |
-          # 用 main 分支/最新 tag 做冒烟；若为 tag 推送则用该版本
+          # 复用 build job 已小写化的镜像引用，避免各处手工拼接导致
+          # 「repository name must be lowercase」这类大小写问题。
+          # 用 main 分支/最新 tag 做冒烟；若为 tag 推送则用该版本。
+          IMAGE_BASE='${{ needs.build.outputs.image }}'
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GITHUB_REF_NAME#v}"
+            IMAGE="${IMAGE_BASE}:${GITHUB_REF_NAME#v}"
           else
-            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            IMAGE="${IMAGE_BASE}:latest"
           fi
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "拉取镜像: $IMAGE"
           docker pull "$IMAGE"
 
       - name: Start container

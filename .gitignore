@@ -1,6 +1,11 @@
 # 本地工作目录（WorkBuddy 会话数据），不入库
 .workbuddy/
 
+# 本地环境变量（含 TS_AUTHKEY 等敏感信息），严禁入库
+# 只提交 .env.example 模板
+.env
+.env.local
+
 # 构建产物
 out/
 *.derper

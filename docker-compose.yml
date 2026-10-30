@@ -1,0 +1,137 @@
+# IP DERPer Plus —— docker compose 部署模板
+#
+# ⚠️ 两种场景互斥，必须显式二选一（默认什么都不启动，避免误冲突）：
+#
+#   基础中转（不校验客户端，任何人可用）：
+#     docker compose --profile basic up -d
+#
+#   带防盗（只有同一 tailnet 的节点可用）：
+#     docker compose --profile anti-theft up -d
+#
+#   查看状态:   docker compose ps
+#   看日志:     docker compose logs -f
+#   停止:       docker compose down
+#
+# ---------------------------------------------------------------------------
+# ⚠️ 三个卷**必须**持久化，否则重启会出问题：
+#
+#   derper-certs    -> /app/certs
+#       证书目录。丢失会重签证书，而客户端 DERPMap 里记录的是证书哈希
+#       （CertName: sha256-raw:...），哈希一变已配置的节点全部失效。
+#
+#   derper-nodekey  -> /var/lib/derper
+#       derper 的 nodekey。丢失会生成新的节点身份，mesh / 防盗链路全部失效。
+#       注意：这条是修复中新增的要求，老部署升级时务必补上这个卷。
+#
+#   derper-state    -> /var/lib/tailscale   （仅防盗模式）
+#       tailscaled 登录态。丢失需要重新走一遍登录。
+#
+# ---------------------------------------------------------------------------
+# ⚠️ 使用前必读
+#
+#   1. DERP_HOST 必须改成公网 IP 或域名，别用默认的 127.0.0.1。
+#      建议在同目录放一个 .env 文件：
+#        DERP_HOST=1.2.3.4
+#        TS_AUTHKEY=tskey-auth-xxxxx     # 仅防盗模式需要
+#      compose 会自动读取 .env，不用改本文件。
+#
+#   2. 用 IP 时证书自动生成 IP 类型 SAN，用域名时生成 DNS 类型 SAN，
+#      两种都已正确处理。
+#
+#   3. 防盗模式依赖 NET_ADMIN + /dev/net/tun。云厂商的「应用托管」类产品
+#      （如雨云云应用）一般不提供，只能跑在 vm / k8s / 自有服务器上。
+#
+#   4. 防盗模式建议 host 网络。STUN 与 DERP 都走 UDP，NAT 后做端口映射
+#      容易出问题。host 模式下 ports 配置对本 service 不生效，属正常现象。
+#
+# ---------------------------------------------------------------------------
+
+services:
+  # ===========================================================================
+  # 场景 A：基础中转
+  # 不启动 tailscaled，不校验客户端，普通端口映射即可。
+  # ===========================================================================
+  derper:
+    profiles: ["basic"]
+    image: ghcr.io/tarocats/ip_derper_plus:latest
+    container_name: ip-derper
+    restart: unless-stopped
+
+    ports:
+      - "443:443"          # DERP HTTPS
+      - "80:80"            # HTTP，健康检查 /generate_204 挂在这里
+      - "3478:3478/udp"    # STUN，必须是 UDP
+
+    environment:
+      # 必改：公网 IP 或域名
+      DERP_HOST: "${DERP_HOST:?请在 .env 或环境变量里设置 DERP_HOST 为公网 IP 或域名}"
+      DERP_ADDR: ":443"
+      DERP_HTTP_PORT: "80"
+      DERP_STUN: "true"
+      DERP_STUN_PORT: "3478"
+      DERP_VERIFY_CLIENTS: "false"
+
+    volumes:
+      - derper-certs:/app/certs
+      - derper-nodekey:/var/lib/derper
+
+    # 健康检查：用 /generate_204 而不是 /derp/probe。
+    # 后者在 80 端口会被 302 重定向到 https，而 https 是自签证书，curl 校验必失败。
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:80/generate_204"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ===========================================================================
+  # 场景 B：带防盗
+  # 按需启动本地 tailscaled，校验客户端是否属于同一 tailnet。
+  # ===========================================================================
+  derper-anti-theft:
+    profiles: ["anti-theft"]
+    image: ghcr.io/tarocats/ip_derper_plus:latest
+    container_name: ip-derper
+    restart: unless-stopped
+
+    # host 网络：STUN/DERP 走 UDP，NAT 后映射容易出问题。
+    # 与上面的 ports 段不兼容，故本 service 不写 ports。
+    network_mode: host
+
+    cap_add:
+      - NET_ADMIN          # tailscaled 需要
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+
+    environment:
+      DERP_HOST: "${DERP_HOST:?请在 .env 或环境变量里设置 DERP_HOST 为公网 IP 或域名}"
+      DERP_ADDR: ":443"
+      DERP_HTTP_PORT: "80"
+      DERP_STUN: "true"
+      DERP_STUN_PORT: "3478"
+      # 开防盗：会按需拉起 tailscaled 并 up 登录
+      DERP_VERIFY_CLIENTS: "true"
+      # 必填。为空且无历史登录态时，entrypoint 会自动降级为不校验并打印警告。
+      TS_AUTHKEY: "${TS_AUTHKEY:-}"
+      TS_STATE_DIR: "/var/lib/tailscale"
+      TS_EXTRA_ARGS: "--advertise-tags=tag:container"
+
+    volumes:
+      - derper-certs:/app/certs
+      - derper-nodekey:/var/lib/derper
+      - derper-state:/var/lib/tailscale    # 保存 tailscale 登录态
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:80/generate_204"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s    # 防盗模式要等 tailscaled 登录，给足启动时间
+
+# ---------------------------------------------------------------------------
+# 持久卷。三个都保留，基础模式只用到前两个，多出来的空卷无害。
+# ---------------------------------------------------------------------------
+volumes:
+  derper-certs:
+  derper-nodekey:
+  derper-state:

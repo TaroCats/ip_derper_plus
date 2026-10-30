@@ -43,6 +43,23 @@ DERP 服务器，于是诞生了 ip_derper 项目。
 
 ### 快速运行
 
+推荐用 docker compose，已处理好持久卷、健康检查与防盗权限：
+
+```sh
+cp .env.example .env
+# 编辑 .env，把 DERP_HOST 改成你的公网 IP 或域名
+
+# 基础中转（不校验客户端）
+docker compose --profile basic up -d
+
+# 或带防盗（只有同一 tailnet 的节点可用）
+docker compose --profile anti-theft up -d
+```
+
+> 两种模式互斥，必须显式二选一，避免端口与容器名冲突。
+
+只想用 `docker run` 的话：
+
 ```sh
 docker run -d --name derper \
   --restart unless-stopped \
